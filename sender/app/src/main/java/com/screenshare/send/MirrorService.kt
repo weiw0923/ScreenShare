@@ -45,8 +45,8 @@ class MirrorService : Service() {
     private var surface: Surface? = null
     private var width = 0
     private var height = 0
-    private var ptsBaseUs = 0L
     private var lastPtsUs = 0L
+    @Volatile private var draining = false
     private var audioThread: Thread? = null
     private var audioCodec: MediaCodec? = null
     private var audioRecord: android.media.AudioRecord? = null
@@ -146,12 +146,16 @@ class MirrorService : Service() {
             surface, null, null
         )
 
-        // bring PAT/PMT up and register with server
+        // bring PAT/PMT up and register with server before the drain thread starts
         MirrorServer.start()
         MirrorServer.broadcastInit(muxer.buildPat() + muxer.buildPmt())
+        isRunning = true
         drainCodec()
         startAudio()
-        isRunning = true
+        if (!audioRunning) {
+            muxer.setHasAudio(false)
+            MirrorServer.broadcastInit(muxer.buildPat() + muxer.buildPmt())
+        }
     }
 
     private fun startAudio() {
@@ -182,7 +186,8 @@ class MirrorService : Service() {
                 val info = MediaCodec.BufferInfo()
                 val pcm = ByteArray(8192)
                 var ptsUs = 0L
-                val bytesPerUs = sampleRate.toDouble() / 1_000_000.0 / 4.0  // stereo 16bit
+                // stereo s16: 4 bytes per sample. Dividing here made audio PTS 16x too fast.
+                val bytesPerUs = sampleRate * 4.0 / 1_000_000.0
                 var lastRealtime = System.nanoTime() / 1000
                 while (audioRunning) {
                     val rec = audioRecord ?: break
@@ -203,12 +208,17 @@ class MirrorService : Service() {
                             outIdx = c.dequeueOutputBuffer(info, 0)
                             continue
                         }
-                        if (info.size > 0) {
+                        if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                             val out = ByteArray(info.size)
-                            c.getOutputBuffer(outIdx)?.get(out)
-                            // wrap raw AAC into ADTS header (LC, 44.1k stereo)
-                            val adts = adtsHeader(info.size, sampleRate, 2) + out
-                            MirrorServer.broadcast(muxer.packetizeAudio(adts, info.presentationTimeUs))
+                            val buf = c.getOutputBuffer(outIdx)
+                            if (buf != null) {
+                                buf.position(info.offset)
+                                buf.limit(info.offset + info.size)
+                                buf.get(out)
+                                // wrap raw AAC into ADTS header (LC, 44.1k stereo)
+                                val adts = adtsHeader(info.size, sampleRate, 2) + out
+                                MirrorServer.broadcast(muxer.packetizeAudio(adts, info.presentationTimeUs), false)
+                            }
                         }
                         c.releaseOutputBuffer(outIdx, false)
                         outIdx = c.dequeueOutputBuffer(info, 0)
@@ -240,28 +250,27 @@ class MirrorService : Service() {
     }
 
     private fun drainCodec() {
+        draining = true
         codecExecutor.execute {
             val info = MediaCodec.BufferInfo()
-            while (isRunning) {
+            while (draining) {
                 val c = codec ?: break
                 try {
                     val idx = c.dequeueOutputBuffer(info, 10_000)
                     if (idx < 0) continue
                     when {
                         info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 -> {
-                            // SPS/PPS
-                            val out = ByteArray(info.size)
-                            c.getOutputBuffer(idx)?.get(out)
-                            parseSpsPps(out)
+                            readCodecBuffer(c, idx, info)?.let { parseSpsPps(it) }
                         }
                         info.size > 0 -> {
-                            val out = ByteArray(info.size)
-                            c.getOutputBuffer(idx)?.get(out)
-                            val key = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-                            val ptsUs = info.presentationTimeUs
-                            lastPtsUs = ptsUs
-                            val ts = muxer.packetizeVideo(out, key, ptsUs)
-                            MirrorServer.broadcast(ts)
+                            val out = readCodecBuffer(c, idx, info)
+                            if (out != null) {
+                                val key = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+                                val ptsUs = info.presentationTimeUs
+                                lastPtsUs = ptsUs
+                                val ts = muxer.packetizeVideo(out, key, ptsUs)
+                                MirrorServer.broadcast(ts, key)
+                            }
                         }
                     }
                     c.releaseOutputBuffer(idx, false)
@@ -270,7 +279,46 @@ class MirrorService : Service() {
         }
     }
 
+    private fun readCodecBuffer(c: MediaCodec, idx: Int, info: MediaCodec.BufferInfo): ByteArray? {
+        val buf = c.getOutputBuffer(idx) ?: return null
+        if (info.size <= 0) return null
+        val out = ByteArray(info.size)
+        buf.position(info.offset)
+        buf.limit(info.offset + info.size)
+        buf.get(out)
+        return out
+    }
+
     private fun parseSpsPps(config: ByteArray) {
+        if (config.size >= 7 && config[0].toInt() == 1) {
+            // AVCDecoderConfigurationRecord (what MediaCodec puts in CODEC_CONFIG).
+            var offset = 5
+            val numSps = config[offset].toInt() and 0x1F
+            offset++
+            var sps: ByteArray? = null
+            var pps: ByteArray? = null
+            repeat(numSps) {
+                if (offset + 2 > config.size) return
+                val len = ((config[offset].toInt() and 0xFF) shl 8) or (config[offset + 1].toInt() and 0xFF)
+                offset += 2
+                if (len <= 0 || offset + len > config.size) return
+                sps = config.copyOfRange(offset, offset + len)
+                offset += len
+            }
+            if (offset >= config.size) return
+            val numPps = config[offset].toInt() and 0xFF
+            offset++
+            repeat(numPps) {
+                if (offset + 2 > config.size) return
+                val len = ((config[offset].toInt() and 0xFF) shl 8) or (config[offset + 1].toInt() and 0xFF)
+                offset += 2
+                if (len <= 0 || offset + len > config.size) return
+                pps = config.copyOfRange(offset, offset + len)
+                offset += len
+            }
+            if (sps != null && pps != null) muxer.setSpsPps(sps!!, pps!!)
+            return
+        }
         // split Annex-B into NALs, collect SPS(7)/PPS(8)
         var sps: ByteArray? = null
         var pps: ByteArray? = null
@@ -297,6 +345,7 @@ class MirrorService : Service() {
 
     private fun stopSelfSafely() {
         isRunning = false
+        draining = false
         audioRunning = false
         try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
         try { audioCodec?.stop(); audioCodec?.release() } catch (_: Exception) {}

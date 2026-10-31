@@ -1,7 +1,6 @@
 package com.screenshare.tv.upnp
 
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
@@ -64,13 +63,39 @@ class UpnpHttpServer(
         sock.use { s ->
             try {
                 s.soTimeout = 10000
-                val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
-                val requestLine = reader.readLine() ?: return
+                // Content-Length is a byte count. Reading that many UTF-8 characters
+                // blocks forever once a title contains a multibyte character (Chinese
+                // filenames), because the sender has already finished the body.
+                val input = s.getInputStream()
+                val headerBytes = ByteArrayOutputStream()
+                val one = ByteArray(1)
+                while (headerBytes.size() < 65536) {
+                    val n = input.read(one)
+                    if (n < 0) return
+                    headerBytes.write(one, 0, 1)
+                    val all = headerBytes.toByteArray()
+                    val len = all.size
+                    if (len >= 4 &&
+                        all[len - 4] == '\r'.code.toByte() &&
+                        all[len - 3] == '\n'.code.toByte() &&
+                        all[len - 2] == '\r'.code.toByte() &&
+                        all[len - 1] == '\n'.code.toByte()
+                    ) break
+                }
+                val rawHeader = headerBytes.toByteArray()
+                val headerEnd = rawHeader.size
+                val headerComplete = headerEnd >= 4 &&
+                    rawHeader[headerEnd - 4] == '\r'.code.toByte() &&
+                    rawHeader[headerEnd - 3] == '\n'.code.toByte() &&
+                    rawHeader[headerEnd - 2] == '\r'.code.toByte() &&
+                    rawHeader[headerEnd - 1] == '\n'.code.toByte()
+                if (!headerComplete) return
+                val headerText = headerBytes.toString(Charsets.ISO_8859_1)
+                val lines = headerText.split("\r\n")
+                val requestLine = lines.firstOrNull()?.takeIf { it.isNotEmpty() } ?: return
                 var contentLength = 0
                 var soapAction = ""
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    if (line.isEmpty()) break
+                for (line in lines) {
                     if (line.lowercase().startsWith("content-length:")) {
                         contentLength = line.substringAfter(':').trim().toIntOrNull() ?: 0
                     }
@@ -78,15 +103,17 @@ class UpnpHttpServer(
                         soapAction = line.substringAfter(':').trim()
                     }
                 }
+                if (contentLength < 0) contentLength = 0
+                if (contentLength > 256 * 1024) contentLength = 256 * 1024
                 val body = if (contentLength > 0) {
-                    val cb = CharArray(contentLength)
+                    val buf = ByteArray(contentLength)
                     var read = 0
                     while (read < contentLength) {
-                        val n = reader.read(cb, read, contentLength - read)
+                        val n = input.read(buf, read, contentLength - read)
                         if (n < 0) break
                         read += n
                     }
-                    String(cb, 0, read)
+                    String(buf, 0, read, Charsets.UTF_8)
                 } else ""
 
                 val out = s.getOutputStream()

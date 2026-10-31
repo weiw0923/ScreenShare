@@ -120,14 +120,18 @@ object DlnaController {
     }
 
     private fun soapRaw(url: String, action: String, body: String): String {
+        val bytes = body.toByteArray(Charsets.UTF_8)
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.doOutput = true
         conn.connectTimeout = 5000
         conn.readTimeout = 8000
+        // Pin a byte length. Chunked SOAP (or a length counted in characters)
+        // makes some renderers wait forever once the title is multibyte UTF-8.
+        conn.setFixedLengthStreamingMode(bytes.size)
         conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
         conn.setRequestProperty("SOAPACTION", "\"urn:schemas-upnp-org:service:AVTransport:1#$action\"")
-        conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        conn.outputStream.use { it.write(bytes) }
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
         val text = stream?.bufferedReader(Charsets.UTF_8)?.use(BufferedReader::readText) ?: ""
