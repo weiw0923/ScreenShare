@@ -18,9 +18,10 @@ class TsMuxer {
     private var audioContinuity = 0
     private var spsPps: ByteArray? = null
     private var hasAudio = true
+    private val psiLock = Any()
 
     /** Drop the AAC elementary stream when capture failed, so players do not wait on it. */
-    fun setHasAudio(enabled: Boolean) { hasAudio = enabled }
+    fun setHasAudio(enabled: Boolean) { synchronized(psiLock) { hasAudio = enabled } }
 
     companion object {
         const val PAT_PID = 0
@@ -61,7 +62,7 @@ class TsMuxer {
     }
 
     /** PAT, one 188-byte packet. Program 1 maps to PMT PID 0x1000. */
-    fun buildPat(): ByteArray {
+    fun buildPat(): ByteArray = synchronized(psiLock) {
         val p = ByteArray(TS_PACKET)
         p[0] = 0x47
         p[1] = 0x40          // PUSI set, PAT_PID=0
@@ -84,7 +85,7 @@ class TsMuxer {
         return p
     }
 
-    fun buildPmt(): ByteArray {
+    fun buildPmt(): ByteArray = synchronized(psiLock) {
         val p = ByteArray(TS_PACKET)
         p[0] = 0x47
         p[1] = ((PMT_PID ushr 8) and 0x1F or 0x40).toByte()
@@ -126,6 +127,9 @@ class TsMuxer {
         for (i in end + 4 until TS_PACKET) p[i] = 0xFF.toByte()
         return p
     }
+
+    /** Fresh PAT+PMT. One lock so the two continuity counters stay a pair. */
+    fun buildPatPmt(): ByteArray = synchronized(psiLock) { buildPat() + buildPmt() }
 
     /**
      * Wrap one H.264 access unit into PES+TS packets.

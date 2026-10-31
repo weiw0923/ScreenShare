@@ -1,5 +1,7 @@
 package com.screenshare.tv.ssdp
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -14,6 +16,7 @@ import java.util.concurrent.Executors
  * UPnP 1.0 subset: MediaRenderer device, single AVTransport service.
  */
 class SsdpResponder(
+    private val context: Context,
     private val friendlyName: String,
     private val httpPort: Int,
     private val uuid: String
@@ -21,9 +24,19 @@ class SsdpResponder(
     private val executor = Executors.newSingleThreadExecutor()
     @Volatile private var running = false
     private var socket: DatagramSocket? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     fun start() {
         if (running) return
+        // Many Wi-Fi drivers drop multicast unless some app holds a MulticastLock.
+        try {
+            val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wm.createMulticastLock("ScreenShareSsdp").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {
+        }
         executor.execute {
             var ss: MulticastSocket? = null
             try {
@@ -116,5 +129,10 @@ class SsdpResponder(
         running = false
         try { socket?.close() } catch (_: Exception) {}
         socket = null
+        try {
+            multicastLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
+        multicastLock = null
     }
 }

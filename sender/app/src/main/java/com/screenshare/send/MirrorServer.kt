@@ -5,6 +5,7 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -24,8 +25,15 @@ object MirrorServer {
     private val clients = CopyOnWriteArrayList<Sink>()
     private val writeLock = Any()
 
-    /** Latest PAT+PMT pair, resent on each keyframe so a joiner can start decoding. */
-    @Volatile var patPmt: ByteArray? = null
+    /**
+     * Builds a new PAT+PMT on each call so the continuity counters advance.
+     * Re-sending one cached packet repeats the same counter forever.
+     */
+    @Volatile var psiSource: (() -> ByteArray)? = null
+
+    /** Fired after a client is admitted, so the encoder can emit an IDR immediately. */
+    @Volatile var onClientConnected: (() -> Unit)? = null
+
     @Volatile var running = false
 
     /** Shared secret for this mirror session. The cast URL must carry `k=<token>`. */
@@ -61,7 +69,8 @@ object MirrorServer {
             clients.clear()
         }
         server = null
-        patPmt = null
+        psiSource = null
+        onClientConnected = null
     }
 
     fun localIp(): String? {
@@ -108,10 +117,7 @@ object MirrorServer {
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 out.flush(); sock.close(); return
             }
-            val token = streamToken
-            val authed = token.isNotEmpty() &&
-                target.substringAfter('?', "").split('&').any { it == "k=$token" }
-            if (!authed) {
+            if (!tokenMatches(target, streamToken)) {
                 out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 out.flush(); sock.close(); return
             }
@@ -122,8 +128,10 @@ object MirrorServer {
                     "Connection: close\r\n\r\n").toByteArray()
             )
             out.flush()
-            sink = Sink(out)
-            synchronized(writeLock) { clients.add(sink!!) }
+            val added = Sink(out)
+            sink = added
+            synchronized(writeLock) { clients.add(added) }
+            try { onClientConnected?.invoke() } catch (_: Exception) {}
             // block until client goes away
             try { input.read(ByteArray(1)) } catch (_: Exception) {}
         } catch (_: Exception) {
@@ -133,23 +141,19 @@ object MirrorServer {
         }
     }
 
-    /** Remember PAT/PMT. Callers resend it in front of every keyframe. */
-    fun broadcastInit(patPmtBytes: ByteArray) {
-        patPmt = patPmtBytes
-    }
-
     /**
      * Write one TS burst. Video and audio call this from different threads;
      * the lock keeps 188-byte packets intact. A client stays silent until the
-     * next keyframe, which is prefixed with PAT/PMT so the decoder can join.
+     * next keyframe, which is prefixed with a freshly built PAT/PMT.
      */
     fun broadcast(ts: ByteArray, keyframe: Boolean = false) {
+        val psi = if (keyframe) freshPsi() else null
         synchronized(writeLock) {
             val dead = ArrayList<Sink>()
             for (c in clients) {
                 try {
                     if (keyframe) {
-                        patPmt?.let { c.out.write(it) }
+                        psi?.let { c.out.write(it) }
                         c.primed = true
                     }
                     if (!c.primed) continue
@@ -161,5 +165,42 @@ object MirrorServer {
             }
             if (dead.isNotEmpty()) clients.removeAll(dead)
         }
+    }
+
+    /** PAT/PMT for clients already in the stream. Does not admit a waiting client. */
+    fun broadcastPsi(packets: ByteArray) {
+        if (packets.isEmpty()) return
+        synchronized(writeLock) {
+            val dead = ArrayList<Sink>()
+            for (c in clients) {
+                if (!c.primed) continue
+                try {
+                    c.out.write(packets)
+                    c.out.flush()
+                } catch (_: Exception) {
+                    dead.add(c)
+                }
+            }
+            if (dead.isNotEmpty()) clients.removeAll(dead)
+        }
+    }
+
+    private fun freshPsi(): ByteArray? = try {
+        psiSource?.invoke()
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun tokenMatches(target: String, token: String): Boolean {
+        if (token.isEmpty()) return false
+        val presented = target.substringAfter('?', "")
+            .split('&')
+            .firstOrNull { it.startsWith("k=") }
+            ?.substring(2)
+            ?: return false
+        return MessageDigest.isEqual(
+            presented.toByteArray(Charsets.UTF_8),
+            token.toByteArray(Charsets.UTF_8)
+        )
     }
 }

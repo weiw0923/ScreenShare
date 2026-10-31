@@ -67,31 +67,8 @@ class UpnpHttpServer(
                 // blocks forever once a title contains a multibyte character (Chinese
                 // filenames), because the sender has already finished the body.
                 val input = s.getInputStream()
-                val headerBytes = ByteArrayOutputStream()
-                val one = ByteArray(1)
-                while (headerBytes.size() < 65536) {
-                    val n = input.read(one)
-                    if (n < 0) return
-                    headerBytes.write(one, 0, 1)
-                    val all = headerBytes.toByteArray()
-                    val len = all.size
-                    if (len >= 4 &&
-                        all[len - 4] == '\r'.code.toByte() &&
-                        all[len - 3] == '\n'.code.toByte() &&
-                        all[len - 2] == '\r'.code.toByte() &&
-                        all[len - 1] == '\n'.code.toByte()
-                    ) break
-                }
-                val rawHeader = headerBytes.toByteArray()
-                val headerEnd = rawHeader.size
-                val headerComplete = headerEnd >= 4 &&
-                    rawHeader[headerEnd - 4] == '\r'.code.toByte() &&
-                    rawHeader[headerEnd - 3] == '\n'.code.toByte() &&
-                    rawHeader[headerEnd - 2] == '\r'.code.toByte() &&
-                    rawHeader[headerEnd - 1] == '\n'.code.toByte()
-                if (!headerComplete) return
-                val headerText = headerBytes.toString(Charsets.ISO_8859_1)
-                val lines = headerText.split("\r\n")
+                val headerText = readHttpHeaders(input) ?: return
+                val lines = headerText.split('\n').map { it.trimEnd('\r') }
                 val requestLine = lines.firstOrNull()?.takeIf { it.isNotEmpty() } ?: return
                 var contentLength = 0
                 var soapAction = ""
@@ -139,6 +116,34 @@ class UpnpHttpServer(
                 }
             } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Read until `\r\n\r\n` or `\n\n`. One byte at a time so the body stays in the
+     * socket, tracking only the previous three bytes instead of copying the buffer.
+     */
+    private fun readHttpHeaders(input: java.io.InputStream): String? {
+        val headerBytes = ByteArrayOutputStream()
+        var p1 = -1
+        var p2 = -1
+        var p3 = -1
+        var complete = false
+        while (headerBytes.size() < 65536) {
+            val b = input.read()
+            if (b < 0) return null
+            headerBytes.write(b)
+            val lfLf = p3 == '\n'.code && b == '\n'.code
+            val crlfCrlf = p1 == '\r'.code && p2 == '\n'.code && p3 == '\r'.code && b == '\n'.code
+            if (lfLf || crlfCrlf) {
+                complete = true
+                break
+            }
+            p1 = p2
+            p2 = p3
+            p3 = b
+        }
+        if (!complete) return null
+        return headerBytes.toString(Charsets.ISO_8859_1)
     }
 
     private fun handleAction(action: String, body: String, out: java.io.OutputStream) {

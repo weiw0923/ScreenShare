@@ -48,6 +48,7 @@ class MirrorService : Service() {
     private var lastPtsUs = 0L
     @Volatile private var draining = false
     private var audioThread: Thread? = null
+    private var psiThread: Thread? = null
     private var audioCodec: MediaCodec? = null
     private var audioRecord: android.media.AudioRecord? = null
     @Volatile private var audioRunning = false
@@ -133,6 +134,8 @@ class MirrorService : Service() {
             setInteger(MediaFormat.KEY_BIT_RATE, 6_000_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // A static screen otherwise produces no frames, so a joiner waits forever for an IDR.
+            setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)
         }
         codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -146,15 +149,43 @@ class MirrorService : Service() {
             surface, null, null
         )
 
-        // bring PAT/PMT up and register with server before the drain thread starts
+        MirrorServer.onClientConnected = { requestSyncFrame() }
+        MirrorServer.psiSource = { muxer.buildPatPmt() }
         MirrorServer.start()
-        MirrorServer.broadcastInit(muxer.buildPat() + muxer.buildPmt())
+        startAudio()
+        if (!audioRunning) muxer.setHasAudio(false)
         isRunning = true
         drainCodec()
-        startAudio()
-        if (!audioRunning) {
-            muxer.setHasAudio(false)
-            MirrorServer.broadcastInit(muxer.buildPat() + muxer.buildPmt())
+        startPsiRefresh()
+    }
+
+    private fun requestSyncFrame() {
+        val c = codec ?: return
+        try {
+            c.setParameters(android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            })
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun startPsiRefresh() {
+        psiThread = Thread({
+            while (draining) {
+                try {
+                    MirrorServer.broadcastPsi(muxer.buildPatPmt())
+                } catch (_: Exception) {
+                }
+                if (!draining) break
+                try {
+                    Thread.sleep(400)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }, "MirrorPsi").also {
+            it.isDaemon = true
+            it.start()
         }
     }
 
@@ -185,22 +216,23 @@ class MirrorService : Service() {
             audioThread = Thread({
                 val info = MediaCodec.BufferInfo()
                 val pcm = ByteArray(8192)
-                var ptsUs = 0L
                 // stereo s16: 4 bytes per sample. Dividing here made audio PTS 16x too fast.
                 val bytesPerUs = sampleRate * 4.0 / 1_000_000.0
-                var lastRealtime = System.nanoTime() / 1000
                 while (audioRunning) {
                     val rec = audioRecord ?: break
                     val n = rec.read(pcm, 0, pcm.size)
                     if (n <= 0) continue
                     val c = audioCodec ?: break
+                    // Video frames from the virtual display are stamped with the monotonic
+                    // clock. A counter that starts at 0 puts audio ~minutes away from video.
+                    val durationUs = (n / bytesPerUs).toLong().coerceAtLeast(0L)
+                    val ptsUs = System.nanoTime() / 1000 - durationUs
                     val inIdx = c.dequeueInputBuffer(10_000)
                     if (inIdx >= 0) {
                         val inBuf = c.getInputBuffer(inIdx)!!
                         inBuf.clear()
                         inBuf.put(pcm, 0, n)
                         c.queueInputBuffer(inIdx, 0, n, ptsUs, 0)
-                        ptsUs += (n / bytesPerUs).toLong()
                     }
                     var outIdx = c.dequeueOutputBuffer(info, 10_000)
                     while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -223,7 +255,6 @@ class MirrorService : Service() {
                         c.releaseOutputBuffer(outIdx, false)
                         outIdx = c.dequeueOutputBuffer(info, 0)
                     }
-                    lastRealtime = System.nanoTime() / 1000
                 }
             }, "MirrorAudio").also { it.start() }
         } catch (_: Exception) {
@@ -347,6 +378,10 @@ class MirrorService : Service() {
         isRunning = false
         draining = false
         audioRunning = false
+        MirrorServer.onClientConnected = null
+        try { psiThread?.interrupt() } catch (_: Exception) {}
+        try { psiThread?.join(500) } catch (_: Exception) {}
+        psiThread = null
         try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
         try { audioCodec?.stop(); audioCodec?.release() } catch (_: Exception) {}
         try { audioThread?.join(500) } catch (_: Exception) {}
