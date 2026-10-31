@@ -408,8 +408,10 @@ class MainActivity : Activity() {
         // 2) wait a moment for server, then push URL to TV
         android.os.Handler(mainLooper).postDelayed({
             val ip = MirrorServer.localIp() ?: run { toast("获取手机 IP 失败"); return@postDelayed }
+            val token = MirrorServer.streamToken
+            if (token.isEmpty()) { toast("镜像服务未就绪"); return@postDelayed }
             statusView.text = "镜像推流中：$ip:8080/live.ts"
-            DlnaController.setUriAndPlay(e, "http://$ip:8080/live.ts", "屏幕镜像") { ok ->
+            DlnaController.setUriAndPlay(e, "http://$ip:8080/live.ts?k=$token", "屏幕镜像") { ok ->
                 runOnUiThread {
                     if (ok) {
                         statusView.text = "正在电视上镜像手机屏幕"
@@ -488,5 +490,14 @@ class MainActivity : Activity() {
         try { multicastLock?.release() } catch (_: Exception) {}
     }
 
-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+    /** Seek/pause callbacks arrive on DlnaController's worker thread. Toast from there crashes. */
+    private fun toast(s: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            try {
+                Toast.makeText(applicationContext, s, Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }

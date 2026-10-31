@@ -1,7 +1,6 @@
 package com.screenshare.tv.upnp
 
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
@@ -64,13 +63,16 @@ class UpnpHttpServer(
         sock.use { s ->
             try {
                 s.soTimeout = 10000
-                val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
-                val requestLine = reader.readLine() ?: return
+                // Content-Length is a byte count. Reading that many UTF-8 characters
+                // blocks forever once a title contains a multibyte character (Chinese
+                // filenames), because the sender has already finished the body.
+                val input = s.getInputStream()
+                val headerText = readHttpHeaders(input) ?: return
+                val lines = headerText.split('\n').map { it.trimEnd('\r') }
+                val requestLine = lines.firstOrNull()?.takeIf { it.isNotEmpty() } ?: return
                 var contentLength = 0
                 var soapAction = ""
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    if (line.isEmpty()) break
+                for (line in lines) {
                     if (line.lowercase().startsWith("content-length:")) {
                         contentLength = line.substringAfter(':').trim().toIntOrNull() ?: 0
                     }
@@ -78,15 +80,17 @@ class UpnpHttpServer(
                         soapAction = line.substringAfter(':').trim()
                     }
                 }
+                if (contentLength < 0) contentLength = 0
+                if (contentLength > 256 * 1024) contentLength = 256 * 1024
                 val body = if (contentLength > 0) {
-                    val cb = CharArray(contentLength)
+                    val buf = ByteArray(contentLength)
                     var read = 0
                     while (read < contentLength) {
-                        val n = reader.read(cb, read, contentLength - read)
+                        val n = input.read(buf, read, contentLength - read)
                         if (n < 0) break
                         read += n
                     }
-                    String(cb, 0, read)
+                    String(buf, 0, read, Charsets.UTF_8)
                 } else ""
 
                 val out = s.getOutputStream()
@@ -112,6 +116,34 @@ class UpnpHttpServer(
                 }
             } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Read until `\r\n\r\n` or `\n\n`. One byte at a time so the body stays in the
+     * socket, tracking only the previous three bytes instead of copying the buffer.
+     */
+    private fun readHttpHeaders(input: java.io.InputStream): String? {
+        val headerBytes = ByteArrayOutputStream()
+        var p1 = -1
+        var p2 = -1
+        var p3 = -1
+        var complete = false
+        while (headerBytes.size() < 65536) {
+            val b = input.read()
+            if (b < 0) return null
+            headerBytes.write(b)
+            val lfLf = p3 == '\n'.code && b == '\n'.code
+            val crlfCrlf = p1 == '\r'.code && p2 == '\n'.code && p3 == '\r'.code && b == '\n'.code
+            if (lfLf || crlfCrlf) {
+                complete = true
+                break
+            }
+            p1 = p2
+            p2 = p3
+            p3 = b
+        }
+        if (!complete) return null
+        return headerBytes.toString(Charsets.ISO_8859_1)
     }
 
     private fun handleAction(action: String, body: String, out: java.io.OutputStream) {

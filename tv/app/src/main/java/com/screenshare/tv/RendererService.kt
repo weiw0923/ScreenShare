@@ -63,7 +63,7 @@ class RendererService : Service() {
             onControl = { action -> handleControl(action) }
         ).also { it.start() }
 
-        ssdp = SsdpResponder("ScreenShare", HTTP_PORT, uuid).also { it.start() }
+        ssdp = SsdpResponder(this, "ScreenShare", HTTP_PORT, uuid).also { it.start() }
         Log.i("RendererService", "renderer up: ssdp+upnp on :$HTTP_PORT")
     }
 

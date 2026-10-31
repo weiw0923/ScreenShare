@@ -18,6 +18,10 @@ class TsMuxer {
     private var audioContinuity = 0
     private var spsPps: ByteArray? = null
     private var hasAudio = true
+    private val psiLock = Any()
+
+    /** Drop the AAC elementary stream when capture failed, so players do not wait on it. */
+    fun setHasAudio(enabled: Boolean) { synchronized(psiLock) { hasAudio = enabled } }
 
     companion object {
         const val PAT_PID = 0
@@ -57,23 +61,23 @@ class TsMuxer {
         spsPps = out.toByteArray()
     }
 
-    /** PAT + PMT, one 188-byte packet each. */
-    fun buildPat(): ByteArray {
+    /** PAT, one 188-byte packet. Program 1 maps to PMT PID 0x1000. */
+    fun buildPat(): ByteArray = synchronized(psiLock) {
         val p = ByteArray(TS_PACKET)
         p[0] = 0x47
         p[1] = 0x40          // PUSI set, PAT_PID=0
         p[2] = 0x00
         p[3] = ((patContinuity and 0xF) or 0x10).toByte()
         patContinuity = (patContinuity + 1) and 0xF
-        p[4] = 0x00
-        p[5] = 0x00
+        p[4] = 0x00                                   // pointer_field
+        p[5] = 0x00                                   // table_id
         p[6] = 0xB0.toByte()
-        p[7] = 0x0D
-        p[8] = 0x00; p[9] = 0x01                      // program_number 1
-        p[10] = 0xC1.toByte()
-        p[11] = 0x00; p[12] = 0x00
-        p[13] = 0xE1.toByte(); p[14] = 0x00           // reserved + PMT_PID = 0x1000
-        p[15] = 0xF0.toByte(); p[16] = 0x00
+        p[7] = 0x0D                                   // section_length = 13
+        p[8] = 0x00; p[9] = 0x01                      // transport_stream_id
+        p[10] = 0xC1.toByte()                         // version 0, current_next = 1
+        p[11] = 0x00; p[12] = 0x00                    // section_number, last_section_number
+        p[13] = 0x00; p[14] = 0x01                    // program_number 1
+        p[15] = 0xF0.toByte(); p[16] = 0x00           // reserved + PMT PID 0x1000
         val crc = crc32Mpeg(p, 5, 12)
         p[17] = (crc ushr 24).toByte(); p[18] = (crc ushr 16).toByte()
         p[19] = (crc ushr 8).toByte(); p[20] = crc.toByte()
@@ -81,7 +85,7 @@ class TsMuxer {
         return p
     }
 
-    fun buildPmt(): ByteArray {
+    fun buildPmt(): ByteArray = synchronized(psiLock) {
         val p = ByteArray(TS_PACKET)
         p[0] = 0x47
         p[1] = ((PMT_PID ushr 8) and 0x1F or 0x40).toByte()
@@ -124,36 +128,43 @@ class TsMuxer {
         return p
     }
 
+    /** Fresh PAT+PMT. One lock so the two continuity counters stay a pair. */
+    fun buildPatPmt(): ByteArray = synchronized(psiLock) { buildPat() + buildPmt() }
+
     /**
      * Wrap one H.264 access unit into PES+TS packets.
      * @param keyframe prepend AUD + SPS/PPS and set random-access flag
      * @param ptsUs presentation timestamp in microseconds
      */
     fun packetizeVideo(nal: ByteArray, keyframe: Boolean, ptsUs: Long): ByteArray {
-        val pes = ByteArrayOutputStream(nal.size + 100)
         val pts = 90000L * ptsUs / 1_000_000L
+        val accessUnit = ByteArrayOutputStream(nal.size + 64)
+        if (keyframe) {
+            accessUnit.write(byteArrayOf(0, 0, 0, 1, 9, 0xF0.toByte()))
+            spsPps?.let { accessUnit.write(it) }
+            if (!hasStartCode(nal)) accessUnit.write(byteArrayOf(0, 0, 0, 1))
+        } else if (!hasStartCode(nal)) {
+            accessUnit.write(byteArrayOf(0, 0, 0, 1))
+        }
+        accessUnit.write(nal)
+        val payload = accessUnit.toByteArray()
+
+        val pes = ByteArrayOutputStream(payload.size + 32)
         pes.write(0); pes.write(0); pes.write(1)
         pes.write(0xE0)
-        pes.write(0x80 or (if (keyframe) 0x04 else 0x00))   // PTS_DTS_flags=10, random_access if key
-        pes.write(0x05)
-        val payloadLen = nal.size + 5
-        if (payloadLen <= 0xFFFF) {
-            pes.write((payloadLen ushr 8).toInt())
-            pes.write(payloadLen and 0xFF)
+        // PES_packet_length covers the optional header (8 bytes) plus the access unit.
+        val packetLen = payload.size + 8
+        if (packetLen <= 0xFFFF) {
+            pes.write((packetLen ushr 8) and 0xFF)
+            pes.write(packetLen and 0xFF)
         } else {
             pes.write(0); pes.write(0)
         }
-        pes.write((0x21 or ((pts ushr 29).toInt() and 0x0E)).toInt())
-        pes.write(((pts ushr 22).toInt() and 0xFF).toInt())
-        pes.write((0x01 or ((pts ushr 14).toInt() and 0xFE)).toInt())
-        pes.write(((pts ushr 7).toInt() and 0xFF).toInt())
-        pes.write((0x01 or ((pts shl 1).toInt() and 0xFE)).toInt())
-        if (keyframe) {
-            pes.write(byteArrayOf(0, 0, 0, 1, 9, 0xF0.toByte()))
-            spsPps?.let { pes.write(it) }
-            pes.write(byteArrayOf(0, 0, 0, 1))
-        }
-        pes.write(nal)
+        pes.write(0x80 or (if (keyframe) 0x04 else 0x00))   // '10' + data_alignment on keyframes
+        pes.write(0x80)                                     // PTS only
+        pes.write(0x05)
+        writePts(pes, pts)
+        pes.write(payload)
 
         val data = pes.toByteArray()
         val out = ByteArrayOutputStream(data.size + TS_PACKET)
@@ -176,12 +187,14 @@ class TsMuxer {
                 pkt[3] = ((videoContinuity - 1 and 0xF) or 0x30).toByte()
                 pkt[4] = 0x07
                 pkt[5] = 0x50.toByte()
-                val pcr = pts * 300
-                pkt[6] = (pcr ushr 25).toByte()
-                pkt[7] = (pcr ushr 17).toByte()
-                pkt[8] = (pcr ushr 9).toByte()
-                pkt[9] = (pcr ushr 1).toByte()
-                pkt[10] = (((pcr and 1).toInt() shl 7) or 0x7E).toByte()
+                // PCR base is the 90 kHz PTS. Multiplying by 300 stored the 27 MHz
+                // clock in the 33-bit base and made the timeline ~300x too fast.
+                val pcrBase = pts
+                pkt[6] = (pcrBase ushr 25).toByte()
+                pkt[7] = (pcrBase ushr 17).toByte()
+                pkt[8] = (pcrBase ushr 9).toByte()
+                pkt[9] = (pcrBase ushr 1).toByte()
+                pkt[10] = (((pcrBase and 1).toInt() shl 7) or 0x7E).toByte()
                 pkt[11] = 0
                 idx = 12
             } else if (needStuffing) {
@@ -220,20 +233,17 @@ class TsMuxer {
         val pts = 90000L * ptsUs / 1_000_000L
         pes.write(0); pes.write(0); pes.write(1)
         pes.write(0xC0)                                   // audio stream id
-        pes.write(0x80)                                   // PTS only
-        pes.write(0x05)
-        val payloadLen = adtsFrame.size + 5
-        if (payloadLen <= 0xFFFF) {
-            pes.write((payloadLen ushr 8).toInt())
-            pes.write(payloadLen and 0xFF)
+        val packetLen = adtsFrame.size + 8
+        if (packetLen <= 0xFFFF) {
+            pes.write((packetLen ushr 8) and 0xFF)
+            pes.write(packetLen and 0xFF)
         } else {
             pes.write(0); pes.write(0)
         }
-        pes.write((0x21 or ((pts ushr 29).toInt() and 0x0E)).toInt())
-        pes.write(((pts ushr 22).toInt() and 0xFF).toInt())
-        pes.write((0x01 or ((pts ushr 14).toInt() and 0xFE)).toInt())
-        pes.write(((pts ushr 7).toInt() and 0xFF).toInt())
-        pes.write((0x01 or ((pts shl 1).toInt() and 0xFE)).toInt())
+        pes.write(0x80)                                   // '10', no scrambling
+        pes.write(0x80)                                   // PTS only
+        pes.write(0x05)
+        writePts(pes, pts)
         pes.write(adtsFrame)
 
         val data = pes.toByteArray()
@@ -272,6 +282,20 @@ class TsMuxer {
             first = false
         }
         return out.toByteArray()
+    }
+
+    private fun hasStartCode(nal: ByteArray): Boolean {
+        if (nal.size >= 4 && nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 0.toByte() && nal[3] == 1.toByte()) return true
+        return nal.size >= 3 && nal[0] == 0.toByte() && nal[1] == 0.toByte() && nal[2] == 1.toByte()
+    }
+
+    /** 5-byte PTS with the ISO/IEC 13818-1 marker bits ('0010' for PTS-only). */
+    private fun writePts(pes: ByteArrayOutputStream, pts: Long) {
+        pes.write((0x21 or ((pts ushr 29).toInt() and 0x0E)))
+        pes.write(((pts ushr 22).toInt() and 0xFF))
+        pes.write((0x01 or ((pts ushr 14).toInt() and 0xFE)))
+        pes.write(((pts ushr 7).toInt() and 0xFF))
+        pes.write((0x01 or ((pts shl 1).toInt() and 0xFE)))
     }
 }
 
