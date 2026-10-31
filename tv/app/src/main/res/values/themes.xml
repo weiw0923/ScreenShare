@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ScreenShare" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#241432</item>
+    </style>
+</resources>
