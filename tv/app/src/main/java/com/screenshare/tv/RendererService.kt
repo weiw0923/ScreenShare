@@ -35,6 +35,8 @@ class RendererService : Service() {
     private var ssdp: SsdpResponder? = null
     private var upnp: UpnpHttpServer? = null
     @Volatile var player: ExoPlayer? = null
+    private var lastUri: String = ""
+    private var liveMode: Boolean = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -47,11 +49,20 @@ class RendererService : Service() {
                 contentResolver, android.provider.Settings.Secure.ANDROID_ID) + "screenshare")
                 .toByteArray()).toString()
 
+        val retryPolicy = object : androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy(
+            /* minimumLoadableRetryCount = */ Int.MAX_VALUE
+        ) {
+            override fun getRetryDelayMsFor(info: androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+                // live streams: hiccup -> short backoff, never fatal
+                return 1500L
+            }
+            override fun getMinimumLoadableRetryCount(dataType: Int): Int = Int.MAX_VALUE
+        }
         player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 androidx.media3.exoplayer.source.DefaultMediaSourceFactory(
                     DefaultDataSource.Factory(this)
-                )
+                ).setLoadErrorHandlingPolicy(retryPolicy)
             )
             .build()
 
@@ -67,6 +78,28 @@ class RendererService : Service() {
             it.start()
             it.startAliveNotifier()
         }
+        // live-stream watchdog: if the current URI dies (CDN token expiry etc), retry it
+        // for a while — the phone sender will push a fresh URL when it reconnects.
+        val watchdog = android.os.Handler(android.os.Looper.getMainLooper())
+        val watchdogRun = object : Runnable {
+            override fun run() {
+                val p = player
+                if (p != null && lastUri.isNotEmpty() &&
+                    (p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) &&
+                    p.playWhenReady) {
+                    Log.i("RendererService", "watchdog: replay $lastUri")
+                    val u = lastUri.lowercase()
+                    val liveMode = u.contains("live") || u.endsWith(".flv") || u.endsWith(".m3u8") || u.endsWith(".ts")
+                    val builder = MediaItem.Builder().setUri(lastUri)
+                    if (liveMode) builder.setLiveConfiguration(MediaItem.LiveConfiguration.Builder().setTargetOffsetMs(3000).build())
+                    p.setMediaItem(builder.build())
+                    p.prepare()
+                    p.playWhenReady = true
+                }
+                watchdog.postDelayed(this, 4000)
+            }
+        }
+        watchdog.postDelayed(watchdogRun, 8000)
         Log.i("RendererService", "renderer up: ssdp+upnp on :$HTTP_PORT")
     }
 
@@ -76,10 +109,20 @@ class RendererService : Service() {
         runOnMain {
             val p = player ?: return@runOnMain
             Log.i("RendererService", "play ${req.uri}")
-            val item = MediaItem.Builder()
-                .setUri(req.uri)
-                .build()
-            p.setMediaItem(item)
+            lastUri = req.uri
+            val u = req.uri.lowercase()
+            val liveMode = u.contains("live") || u.endsWith(".flv") || u.endsWith(".m3u8") || u.endsWith(".ts")
+            val builder = MediaItem.Builder().setUri(req.uri)
+            if (liveMode) {
+                builder.setLiveConfiguration(
+                    MediaItem.LiveConfiguration.Builder()
+                        .setTargetOffsetMs(3000)
+                        .setMinOffsetMs(1000)
+                        .setMaxOffsetMs(8000)
+                        .build()
+                )
+            }
+            p.setMediaItem(builder.build())
             p.prepare()
             p.playWhenReady = true
             onPlaybackStarted?.invoke()
