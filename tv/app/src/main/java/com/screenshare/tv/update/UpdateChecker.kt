@@ -20,7 +20,7 @@ import java.net.URL
  * { "versionCode": 14, "versionName": "1.2.0", "apkUrl": "http://host/ScreenShareTV-1.2.0.apk" }
  */
 object UpdateChecker {
-    const val MANIFEST_URL = "http://192.168.0.110:8910/update.json"
+    const val MANIFEST_URL = "https://api.github.com/repos/weiw0923/ScreenShare/releases/latest"
 
     data class Manifest(val versionCode: Int, val versionName: String, val apkUrl: String)
 
@@ -32,14 +32,17 @@ object UpdateChecker {
                 conn.readTimeout = 6000
                 val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                 conn.disconnect()
-                val code = Regex("\"versionCode\"\\s*:\\s*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
-                val name = Regex("\"versionName\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1) ?: ""
-                val url = Regex("\"apkUrl\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1) ?: ""
-                if (code != null && code > currentVersionCode && url.isNotEmpty()) {
-                    Log.i("UpdateChecker", "update available: $name ($code)")
-                    val apk = download(url)
-                    if (apk != null) installApk(service, apk, name)
-                    onNew(Manifest(code, name, url))
+                if (text.contains("\"draft\": true") || text.contains("\"prerelease\": true")) return@Thread
+                val tag = Regex("\"tag_name\"\\s*:\\s*\"v?([^\"]+)\"").find(text)?.groupValues?.get(1) ?: return@Thread
+                val parts = tag.split(".").map { it.toIntOrNull() ?: 0 }
+                val code = (parts.getOrNull(0) ?: 0) * 10000 + (parts.getOrNull(1) ?: 0) * 100 + (parts.getOrNull(2) ?: 0)
+                val url = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*ScreenShareTV[^\"]*\\.apk)\"")
+                    .find(text)?.groupValues?.get(1) ?: return@Thread
+                if (code > currentVersionCode) {
+                    Log.i("UpdateChecker", "update available: v$tag ($code)")
+                    val apk = download(service, url)
+                    if (apk != null) installApk(service, apk, "v$tag")
+                    onNew(Manifest(code, "v$tag", url))
                 }
             } catch (e: Exception) {
                 Log.w("UpdateChecker", "check failed: ${e.message}")
@@ -47,11 +50,11 @@ object UpdateChecker {
         }.start()
     }
 
-    private fun download(url: String): java.io.File? = try {
+    private fun download(serviceRef: Service, url: String): java.io.File? = try {
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 5000
         conn.readTimeout = 30000
-        val tmp = java.io.File.createTempFile("update", ".apk", java.io.File("/data/local/tmp"))
+        val tmp = java.io.File.createTempFile("update", ".apk", serviceRef.cacheDir)
         conn.inputStream.use { input ->
             tmp.outputStream().use { output -> input.copyTo(output, 64 * 1024) }
         }

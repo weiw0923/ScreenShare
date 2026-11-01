@@ -37,6 +37,23 @@ class StatusActivity : Activity() {
         }
     }
 
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN &&
+            event.keyCode == android.view.KeyEvent.KEYCODE_BACK &&
+            playerView?.visibility == View.VISIBLE) {
+            // 投屏中按返回：停止播放，回到状态页（不退出 app）
+            RendererService.instance?.player?.let { p ->
+                p.stop()
+                p.clearMediaItems()
+            }
+            playerView?.player = null
+            playerView?.visibility = View.GONE
+            findViewById<View>(R.id.status_column)?.visibility = View.VISIBLE
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun onBackPressed() {
         // 退出机制：状态页按返回键 = 停止接收服务并退出
         stopService(Intent(this, RendererService::class.java))

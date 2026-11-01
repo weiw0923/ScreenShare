@@ -70,8 +70,8 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center"
-            android:layout_marginBottom="24dp"
-            android:textSize="16sp"
+            android:layout_marginBottom="28dp"
+            android:textSize="20sp"
             android:textColor="#8A6F7E" />
     </LinearLayout>
 
