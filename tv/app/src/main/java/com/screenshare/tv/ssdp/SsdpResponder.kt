@@ -135,4 +135,42 @@ class SsdpResponder(
         }
         multicastLock = null
     }
+
+    /**
+     * Periodic ssdp:alive NOTIFY. Phones that passively listen (instead of M-SEARCH)
+     * only learn about renderers through these.
+     */
+    fun startAliveNotifier() {
+        executor.execute {
+            try {
+                DatagramSocket().use { sock ->
+                    sock.broadcast = true
+                    val group = InetAddress.getByName("239.255.255.250")
+                    val host = localIpv4Toward(group) ?: return@execute
+                    val location = "http://$host:$httpPort/description.xml"
+                    val targets = listOf(
+                        "upnp:rootdevice",
+                        "urn:schemas-upnp-org:device:MediaRenderer:1",
+                        "urn:schemas-upnp-org:service:AVTransport:1"
+                    )
+                    while (running) {
+                        for (st in targets) {
+                            val usnSuffix = if (st == "upnp:rootdevice") "::upnp:rootdevice" else "::$st"
+                            val nl = "\r\n"
+                            val msg = ("NOTIFY * HTTP/1.1$nl" +
+                                "HOST: 239.255.255.250:1900$nl" +
+                                "CACHE-CONTROL: max-age=1800$nl" +
+                                "LOCATION: $location$nl" +
+                                "NT: $st$nl" +
+                                "NTS: ssdp:alive$nl" +
+                                "SERVER: Android/ScreenShare UPnP/1.0 ScreenShareTV/1.0$nl" +
+                                "USN: $uuid$usnSuffix$nl$nl").toByteArray(Charsets.ISO_8859_1)
+                            sock.send(DatagramPacket(msg, msg.size, group, 1900))
+                        }
+                        Thread.sleep(15000)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
 }
