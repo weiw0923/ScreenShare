@@ -16,15 +16,19 @@ class StatusActivity : Activity() {
         override fun run() {
             val svc = RendererService.instance
             val p = svc?.player
-            if (p != null && p.playbackState != Player.STATE_IDLE && playerView?.player != p) {
+            if (p != null && p.playbackState == Player.STATE_READY && playerView?.player != p) {
                 playerView?.player = p
                 playerView?.visibility = View.VISIBLE
-                statusLine?.visibility = View.GONE
+                statusLine?.visibility = View.VISIBLE   // stays until first frame paints
                 p.play()
-            } else if (p == null || p.playbackState == Player.STATE_IDLE) {
+            } else if (p == null || p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) {
                 playerView?.player = null
                 playerView?.visibility = View.GONE
                 statusLine?.visibility = View.VISIBLE
+            }
+            if (p != null && p.playbackState == Player.STATE_READY && p.isPlaying) {
+                playerView?.visibility = View.VISIBLE
+                statusLine?.visibility = View.GONE
             }
             playerView?.postDelayed(this, 500)
         }
