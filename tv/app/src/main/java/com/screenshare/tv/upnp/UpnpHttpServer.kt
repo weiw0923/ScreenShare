@@ -143,7 +143,8 @@ class UpnpHttpServer(
             p3 = b
         }
         if (!complete) return null
-        return headerBytes.toString(Charsets.ISO_8859_1)
+        val bytes = headerBytes.toByteArray()
+        return String(bytes, 0, bytes.size, Charsets.ISO_8859_1)
     }
 
     private fun handleAction(action: String, body: String, out: java.io.OutputStream) {
