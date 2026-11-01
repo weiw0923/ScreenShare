@@ -37,12 +37,19 @@ class StatusActivity : Activity() {
         }
     }
 
+    override fun onBackPressed() {
+        // 退出机制：状态页按返回键 = 停止接收服务并退出
+        stopService(Intent(this, RendererService::class.java))
+        finish()
+        android.os.Process.killProcess(android.os.Process.myPid())
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.status_screen)
         try {
             val v = packageManager.getPackageInfo(packageName, 0).versionName
-            findViewById<TextView>(R.id.status_line).text = "v$v · 等待手机投屏…"
+            findViewById<TextView>(R.id.version_line).text = "v$v"
         } catch (_: Exception) {}
         playerView = findViewById(R.id.player_view)
         statusLine = findViewById(R.id.status_line)

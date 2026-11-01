@@ -74,6 +74,14 @@ class RendererService : Service() {
             onControl = { action -> handleControl(action) }
         ).also { it.start() }
 
+        // self-hosted auto-update (non-blocking)
+        com.screenshare.tv.update.UpdateChecker.check(
+            this,
+            packageManager.getPackageInfo(packageName, 0).let {
+                if (Build.VERSION.SDK_INT >= 28) it.longVersionCode.toInt() else @Suppress("DEPRECATION") it.versionCode
+            }
+        ) { }
+
         ssdp = SsdpResponder(this, "ScreenShare", HTTP_PORT, uuid).also {
             it.start()
             it.startAliveNotifier()
