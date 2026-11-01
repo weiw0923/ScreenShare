@@ -23,6 +23,9 @@ class UpnpHttpServer(
     @Volatile private var running = false
     @Volatile var lastPositionSec = 0
     @Volatile var durationSec = 0
+    private val subscribers = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile var transportState: String = "NO_MEDIA_PRESENT"
+    @Volatile var volume: Int = 30
 
     fun localIp(): String? {
         val en = NetworkInterface.getNetworkInterfaces()
@@ -69,6 +72,7 @@ class UpnpHttpServer(
                 val input = s.getInputStream()
                 val headerText = readHttpHeaders(input) ?: return
                 val lines = headerText.split('\n').map { it.trimEnd('\r') }
+                val headerTextAll = headerText
                 val requestLine = lines.firstOrNull()?.takeIf { it.isNotEmpty() } ?: return
                 var contentLength = 0
                 var soapAction = ""
@@ -99,6 +103,9 @@ class UpnpHttpServer(
                 // SID before proceeding to SetAVTransportURI. Return a standard grant response.
                 if (requestLine.startsWith("SUBSCRIBE", true)) {
                     val sid = "uuid:" + java.util.UUID.randomUUID()
+                    val cb = Regex("CALLBACK: *<(http://[^>]+)>", RegexOption.IGNORE_CASE)
+                        .find(headerTextAll)?.groupValues?.get(1)
+                    if (cb != null) subscribers[sid] = cb
                     out.write(
                         ("HTTP/1.1 200 OK\r\nSID: $sid\r\nTIMEOUT: Second-1800\r\nSERVER: Android/ScreenShare UPnP/1.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").toByteArray()
                     )
@@ -125,6 +132,10 @@ class UpnpHttpServer(
                         out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n").toByteArray())
                         out.write(bytes)
                         out.flush()
+                    }
+                    requestLine.contains("POST") && requestLine.contains("RenderingControl_control") -> {
+                        val action = Regex("#([A-Za-z]+)").find(soapAction)?.groupValues?.get(1) ?: ""
+                        handleRenderingControl(action, body, out)
                     }
                     requestLine.contains("POST") && requestLine.contains("ConnectionManager_control") -> {
                         val action = Regex("#([A-Za-z]+)").find(soapAction)?.groupValues?.get(1) ?: ""
@@ -194,6 +205,8 @@ class UpnpHttpServer(
                 """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><Track>1</Track><TrackDuration>${fmt(durationSec)}</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>${fmt(lastPositionSec)}</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"""
             }
             "GetProtocolInfo" -> """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1"><Source></Source><Sink>http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,http-get:*:video/webm:*,http-get:*:video/mpeg:*,http-get:*:audio/mpeg:*,http-get:*:audio/flac:*,http-get:*:image/jpeg:*,http-get:*:image/png:*,http-get:*:application/vnd.apple.mpegurl:*,http-get:*:video/mp2t:*</Sink></u:GetProtocolInfoResponse></s:Body></s:Envelope>"""
+            "GetMediaInfo" -> """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetMediaInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><NrTracks>1</NrTracks><MediaDuration>${"%02d:%02d:%02d".format(durationSec/3600,(durationSec%3600)/60,durationSec%60)}</MediaDuration><CurrentURI></CurrentURI><PlayMedium>NETWORK</PlayMedium><TrackSource>NETWORK</TrackSource></u:GetMediaInfoResponse></s:Body></s:Envelope>"""
+            "GetVolume" -> """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"><CurrentVolume>$volume</CurrentVolume></u:GetVolumeResponse></s:Body></s:Envelope>"""
             "GetTransportInfo" -> """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><CurrentTransportState>PLAYING</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>"""
             else -> soapError(action, "401", "Invalid Action")
         }
@@ -221,7 +234,48 @@ class UpnpHttpServer(
     private fun descriptionXml(): String {
         val ip = localIp() ?: "127.0.0.1"
         return """<?xml version="1.0" encoding="utf-8"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><URLBase>http://$ip:$httpPort</URLBase><device><deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType><friendlyName>$friendlyName</friendlyName><manufacturer>ScreenShare</manufacturer><modelName>ScreenShareTV</modelName><UDN>$uuid</UDN><dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC><serviceList><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><serviceId>urn:upnp-org:serviceId:AVTransport</serviceId><SCPDURL>/avtransport.xml</SCPDURL><controlURL>/_urn:schemas-upnp-org:service:AVTransport_control</controlURL><eventSubURL>/_urn:schemas-upnp-org:service:AVTransport_event</eventSubURL></service><service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/connectionmanager.xml</SCPDURL><controlURL>/_urn:schemas-upnp-org:service:ConnectionManager_control</controlURL><eventSubURL>/_urn:schemas-upnp-org:service:ConnectionManager_event</eventSubURL></service></serviceList></device></root>"""
+<root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><URLBase>http://$ip:$httpPort</URLBase><device><deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType><friendlyName>$friendlyName</friendlyName><manufacturer>ScreenShare</manufacturer><modelName>ScreenShareTV</modelName><UDN>$uuid</UDN><dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC><serviceList><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><serviceId>urn:upnp-org:serviceId:AVTransport</serviceId><SCPDURL>/avtransport.xml</SCPDURL><controlURL>/_urn:schemas-upnp-org:service:AVTransport_control</controlURL><eventSubURL>/_urn:schemas-upnp-org:service:AVTransport_event</eventSubURL></service><service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId><SCPDURL>/renderingcontrol.xml</SCPDURL><controlURL>/_urn:schemas-upnp-org:service:RenderingControl_control</controlURL><eventSubURL>/_urn:schemas-upnp-org:service:RenderingControl_event</eventSubURL></service><service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/connectionmanager.xml</SCPDURL><controlURL>/_urn:schemas-upnp-org:service:ConnectionManager_control</controlURL><eventSubURL>/_urn:schemas-upnp-org:service:ConnectionManager_event</eventSubURL></service></serviceList></device></root>"""
+    }
+
+    private fun handleRenderingControl(action: String, body: String, out: java.io.OutputStream) {
+        val response: String = when (action) {
+            "GetVolume" -> """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"><CurrentVolume>$volume</CurrentVolume></u:GetVolumeResponse></s:Body></s:Envelope>"""
+            "SetVolume" -> {
+                Regex("<Volume>(\\d+)</Volume>").find(body)?.groupValues?.get(1)?.toIntOrNull()?.let { volume = it }
+                soapOkRC(action)
+            }
+            "GetMute" -> """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"><CurrentMute>0</CurrentMute></u:GetMuteResponse></s:Body></s:Envelope>"""
+            else -> soapOkRC(action)
+        }
+        val bytes = response.toByteArray(Charsets.UTF_8)
+        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n").toByteArray())
+        out.write(bytes); out.flush()
+    }
+
+    private fun soapOkRC(action: String) =
+        """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:${action}Response xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"></u:${action}Response></s:Body></s:Envelope>"""
+
+    /** GENA event NOTIFY: push state to a subscriber's callback URL. */
+    fun notifySubscriber(sid: String, transportState: String) {
+        val cb = subscribers[sid] ?: return
+        executor.execute {
+            try {
+                java.net.URL(cb).openConnection().let { c ->
+                    (c as java.net.HttpURLConnection).requestMethod = "NOTIFY"
+                    c.setRequestProperty("SID", sid)
+                    c.setRequestProperty("NT", "upnp:event")
+                    c.setRequestProperty("NTS", "upnp:propchange")
+                    c.setRequestProperty("SEQ", "0")
+                    c.doOutput = true
+                    val body = """<?xml version="1.0"?><e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><e:TransportState>$transportState</e:TransportState></e:property></e:propertyset>"""
+                    val bytes = body.toByteArray(Charsets.UTF_8)
+                    c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
+                    c.setRequestProperty("Content-Length", bytes.size.toString())
+                    c.outputStream.use { it.write(bytes) }
+                    c.responseCode
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     private fun scpdXml(): String = """<?xml version="1.0" encoding="utf-8"?>
@@ -232,6 +286,7 @@ class UpnpHttpServer(
 <action><name>Stop</name><argumentList><argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument></argumentList></action>
 <action><name>Seek</name><argumentList><argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument><argument><name>Unit</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SeekMode</relatedStateVariable></argument><argument><name>Target</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SeekTarget</relatedStateVariable></argument></argumentList></action>
 <action><name>GetPositionInfo</name><argumentList><argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument></argumentList></action>
+<action><name>GetMediaInfo</name><argumentList><argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument></argumentList></action>
 <action><name>GetTransportInfo</name><argumentList><argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument></argumentList></action>
 </actionList><serviceStateTable>
 <stateVariable sendEvents="yes"><name>TransportState</name><dataType>string</dataType></stateVariable>
