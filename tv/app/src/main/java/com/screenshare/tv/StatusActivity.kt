@@ -16,19 +16,22 @@ class StatusActivity : Activity() {
         override fun run() {
             val svc = RendererService.instance
             val p = svc?.player
+            val rendering = p != null && p.playbackState == Player.STATE_READY &&
+                (p.isPlaying || p.playbackState == Player.STATE_READY && p.currentPosition > 0)
             if (p != null && p.playbackState == Player.STATE_READY && playerView?.player != p) {
                 playerView?.player = p
-                playerView?.visibility = View.VISIBLE
-                statusLine?.visibility = View.VISIBLE   // stays until first frame paints
                 p.play()
-            } else if (p == null || p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) {
-                playerView?.player = null
-                playerView?.visibility = View.GONE
-                statusLine?.visibility = View.VISIBLE
             }
-            if (p != null && p.playbackState == Player.STATE_READY && p.isPlaying) {
-                playerView?.visibility = View.VISIBLE
-                statusLine?.visibility = View.GONE
+            // fullscreen only once video actually renders; status column stays during buffering
+            findViewById<View>(R.id.status_column).visibility =
+                if (rendering) View.GONE else View.VISIBLE
+            playerView?.visibility = if (rendering) View.VISIBLE else View.GONE
+            if (rendering) {
+                (playerView?.parent as? android.view.ViewGroup)?.keepScreenOn = true
+            }
+            if (p == null || p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) {
+                playerView?.player = null
+                (playerView?.parent as? android.view.ViewGroup)?.keepScreenOn = false
             }
             playerView?.postDelayed(this, 500)
         }
